@@ -1,0 +1,12 @@
+# Local work: game extracts, captures, logs, staging, notes. Never published.
+/work/
+# Build output and downloaded or generated tools
+/proxy/build/
+/tools/dxc-*/
+/tools/.venv/
+/tools/downloads/
+__pycache__/
+*.pyc
+*.obj
+# Release zips (tools/package_release.py).
+/dist/
