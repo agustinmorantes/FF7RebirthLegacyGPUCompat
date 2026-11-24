@@ -998,13 +998,16 @@ static HRESULT STDMETHODCALLTYPE H_CreatePipelineState(ID3D12Device2* dev, const
     std::vector<unsigned char> stream;
     D3D12_PIPELINE_STATE_STREAM_DESC copy = *d;
     ReplaceStreamShaders(d, sh, val, stream, copy);
-    HRESULT hr = o_CreatePipelineState(dev, &copy, riid, out);
+    // On Proton the native call can fault instead of rejecting an unsupported mesh PSO.
+    const bool routeMesh = mesh && g_realMeshTier == 0;
+    HRESULT hr = routeMesh ? E_INVALIDARG : o_CreatePipelineState(dev, &copy, riid, out);
     if (SUCCEEDED(hr) && out && !mesh) PassProfTagPso(*out, sh[6]);
     Hash ms = ShaderHash(sh[25]);
     if (mesh) {
         ++s_psoMs;
         if (FirstTime("MS", ms))
-            Log("MS PSO hr=0x%08lx MS=%s AS=%s PS=%s", hr, ms.s, ShaderHash(sh[24]).s, ShaderHash(sh[2]).s);
+            Log("MS PSO nativeBypassed=%d hr=0x%08lx MS=%s AS=%s PS=%s", routeMesh, hr, ms.s,
+                ShaderHash(sh[24]).s, ShaderHash(sh[2]).s);
     }
     if (FAILED(hr) && out) {
         ++s_psoFailed;
@@ -1096,7 +1099,12 @@ static HRESULT STDMETHODCALLTYPE H_LoadPipeline(ID3D12PipelineLibrary1* lib, LPC
     size_t val[29] = {};
     std::vector<unsigned char> stream;
     D3D12_PIPELINE_STATE_STREAM_DESC copy = *d;
-    if (ParseStream(d, sh, val)) ReplaceStreamShaders(d, sh, val, stream, copy);
+    const bool parsed = ParseStream(d, sh, val);
+    if (g_realMeshTier == 0 && (sh[25].pShaderBytecode || sh[24].pShaderBytecode)) {
+        // Report a cache miss so the title uses the guarded CreatePipelineState path.
+        return E_INVALIDARG;
+    }
+    if (parsed) ReplaceStreamShaders(d, sh, val, stream, copy);
     HRESULT hr = o_LoadPipeline(lib, name, &copy, riid, out);
     if (SUCCEEDED(hr) && out) PassProfTagPso(*out, sh[6]);
     return hr;
@@ -1244,7 +1252,7 @@ static void RegisterEmuRS(void* created, ID3D12RootSignature* compute, UINT para
 }
 
 static HRESULT RetryRootSignature(ID3D12Device* dev, UINT mask, const void* blob, SIZE_T len, REFIID riid, void** out,
-                                  bool log) {
+                                  bool log, bool requireEmulation = false) {
     using PFN_Deserializer = HRESULT(WINAPI*)(const void*, SIZE_T, REFIID, void**);
     using PFN_Serialize = HRESULT(WINAPI*)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, ID3DBlob**, ID3DBlob**);
     static auto deserializer =
@@ -1279,6 +1287,10 @@ static HRESULT RetryRootSignature(ID3D12Device* dev, UINT mask, const void* blob
     unsigned used = 0;
     for (auto& p : params) used |= 1u << p.ShaderVisibility;
     for (UINT i = 0; i < d.NumStaticSamplers; ++i) used |= 1u << *samplerVis(i);
+    if (requireEmulation && !(used & (1u << D3D12_SHADER_VISIBILITY_MESH))) {
+        ds->Release();
+        return E_FAIL;
+    }
     D3D12_SHADER_VISIBILITY remap[8] = {};
     D3D12_SHADER_VISIBILITY spares[] = {D3D12_SHADER_VISIBILITY_HULL, D3D12_SHADER_VISIBILITY_DOMAIN,
                                         D3D12_SHADER_VISIBILITY_GEOMETRY};
@@ -1311,8 +1323,12 @@ static HRESULT RetryRootSignature(ID3D12Device* dev, UINT mask, const void* blob
     ID3D12RootSignature* compute = nullptr;
     if (g_cfg.emulateMesh && remap[D3D12_SHADER_VISIBILITY_MESH])
         compute = CreateComputeRS(dev, mask, *ds->GetUnconvertedRootSignatureDesc(), samplerStride, log);
+    if (requireEmulation && !compute) {
+        ds->Release();
+        return E_FAIL;
+    }
     // With the emulation VB parameter first; without it if that fails (e.g. over the size limit).
-    for (int pass = compute ? 0 : 1; pass < 2; ++pass) {
+    for (int pass = compute ? 0 : 1; pass < (requireEmulation ? 1 : 2); ++pass) {
         D3D12_ROOT_SIGNATURE_FLAGS flags = d.Flags;
         if (pass == 0) {
             D3D12_ROOT_PARAMETER1 vb = {D3D12_ROOT_PARAMETER_TYPE_SRV};
@@ -1338,6 +1354,7 @@ static HRESULT RetryRootSignature(ID3D12Device* dev, UINT mask, const void* blob
         if (newBlob) newBlob->Release();
         if (err) err->Release();
         if (pass == 0 && SUCCEEDED(hr)) {
+            if (requireEmulation) Log("registered proactive mesh emulation root signature");
             RegisterEmuRS(*out, compute, param);
             compute = nullptr;
             break;
@@ -1350,6 +1367,11 @@ static HRESULT RetryRootSignature(ID3D12Device* dev, UINT mask, const void* blob
 
 static HRESULT STDMETHODCALLTYPE H_CreateRootSignature(ID3D12Device* dev, UINT mask, const void* blob, SIZE_T len,
                                                        REFIID riid, void** out) {
+    // Some runtimes accept mesh-visible root signatures even without native mesh support.
+    if (g_cfg.emulateMesh && g_realMeshTier == 0 && out && blob) {
+        HRESULT emu = RetryRootSignature(dev, mask, blob, len, riid, out, false, true);
+        if (SUCCEEDED(emu)) return emu;
+    }
     HRESULT hr = o_CreateRootSignature(dev, mask, blob, len, riid, out);
     if (FAILED(hr) && out && blob) {
         Hash h = ShaderHash({blob, len});  // serialized root signatures are DXBC containers too
