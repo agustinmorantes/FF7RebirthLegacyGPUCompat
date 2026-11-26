@@ -1114,10 +1114,12 @@ static HRESULT STDMETHODCALLTYPE H_CreatePipelineLibrary(ID3D12Device1* dev, con
                                                          void** out) {
     HRESULT hr = o_CreatePipelineLibrary(dev, blob, len, riid, out);
     Log("CreatePipelineLibrary(blob=%zu bytes) = 0x%08lx", len, hr);
-    if (SUCCEEDED(hr) && out && *out && (g_cfg.passPerformanceDiagnostics || !g_replacements.empty())) {
+    const bool hookLoads = g_cfg.passPerformanceDiagnostics || !g_replacements.empty();
+    // Without native mesh support, LoadPipeline must miss on cached mesh PSOs even with no replacements.
+    if (SUCCEEDED(hr) && out && *out && (hookLoads || g_realMeshTier == 0)) {
         ID3D12PipelineLibrary* lib = nullptr;
         ID3D12PipelineLibrary1* lib1 = nullptr;
-        if (SUCCEEDED(((IUnknown*)*out)->QueryInterface(IID_PPV_ARGS(&lib)))) {
+        if (hookLoads && SUCCEEDED(((IUnknown*)*out)->QueryInterface(IID_PPV_ARGS(&lib)))) {
             Patch(lib, vt_lib_LoadGraphicsPipeline, (void*)H_LoadGraphicsPipeline, (void**)&o_LoadGraphicsPipeline);
             Patch(lib, vt_lib_LoadComputePipeline, (void*)H_LoadComputePipeline, (void**)&o_LoadComputePipeline);
             lib->Release();
